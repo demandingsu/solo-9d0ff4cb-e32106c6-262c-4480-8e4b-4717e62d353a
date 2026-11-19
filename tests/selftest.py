@@ -222,6 +222,211 @@ def main():
         r = c.get("/")
         check("首页HTML可访问", r.status_code == 200 and "现役结构" in r.text)
 
+        # ---------------------------------------------------------------
+        # 计算列：同一批读数按新旧口径各算一遍
+        # ---------------------------------------------------------------
+        print("== 11. 计算列：按稳定标识取数（原始列改名后公式不变） ==")
+        r = c.post("/api/versions", json={"note": "加入计算列", "columns": [
+            {"source": "station", "name": "station_code"},
+            {"source": "hour_utc", "name": "UTC小时"},
+            {"source": temp_id, "name": "温度"},
+            {"source": pres_id, "name": "气压"},
+            {"source": hum_id, "name": "湿度"},
+        ], "computed_columns": [
+            {"name": "温压差", "key": "diff", "op": "-",
+             "left": {"kind": "column", "ref": temp_id},
+             "right": {"kind": "column", "ref": pres_id}},
+            {"name": "温压比", "key": "ratio", "op": "/",
+             "left": {"kind": "column", "ref": temp_id},
+             "right": {"kind": "computed", "ref": "diff"}},
+            {"name": "常数和", "op": "+",
+             "left": {"kind": "const", "value": 1},
+             "right": {"kind": "const", "value": 2}},
+        ]})
+        check("发布含计算列的版本", r.status_code == 201, r.text[:300])
+        v6 = r.json()
+        def_v = v6["version_no"]
+        comp = {x["name"]: x for x in v6["computed_columns"]}
+        diff_id, ratio_id, const_id = (comp["温压差"]["computed_id"],
+                                       comp["温压比"]["computed_id"],
+                                       comp["常数和"]["computed_id"])
+        check("计算列有稳定标识且公式按标识取数",
+              comp["温压差"]["formula"] == "温度 - 气压", comp["温压差"]["formula"])
+        check("计算列可引用同一批新列", comp["温压比"]["formula"] == "温度 / 温压差")
+
+        r = c.post("/api/versions", json={"note": "改名不动计算列", "columns": [
+            {"source": "station", "name": "station_code"},
+            {"source": "hour_utc", "name": "UTC小时"},
+            {"source": temp_id, "name": "气温_C"},
+            {"source": pres_id, "name": "气压"},
+            {"source": hum_id, "name": "湿度"},
+        ]})
+        check("改名版本发布成功", r.status_code == 201, r.text[:300])
+        d = c.get("/api/observations", params={"station": "S01",
+                                               "hour_from": "2026-11-18T00:00",
+                                               "hour_to": "2026-11-18T00:00"}).json()
+        row = d["rows"][0]
+        check("改名后计算列仍按稳定标识取到旧批次(温度-气压=5-1013)",
+              row["computed"][diff_id]["value"] == 5 - 1013,
+              json.dumps(row["computed"][diff_id], ensure_ascii=False)[:300])
+        check("计算列依赖链按当时口径求值",
+              row["computed"][ratio_id]["value"] == 5 / (5 - 1013),
+              repr(row["computed"][ratio_id]["value"]))
+        check("常量运算(1+2=3)", row["computed"][const_id]["value"] == 3)
+
+        print("== 12. 间接升版：改上游口径，下游自动升版，无关列沿用 ==")
+        r = c.post("/api/versions", json={"note": "温压差改成 气压-温度", "columns": [
+            {"source": "station", "name": "station_code"},
+            {"source": "hour_utc", "name": "UTC小时"},
+            {"source": temp_id, "name": "气温_C"},
+            {"source": pres_id, "name": "气压"},
+            {"source": hum_id, "name": "湿度"},
+        ], "computed_columns": [
+            {"column_id": diff_id, "op": "-",
+             "left": {"kind": "column", "ref": pres_id},
+             "right": {"kind": "column", "ref": temp_id}},
+        ]})
+        check("发布上游新口径成功", r.status_code == 201, r.text[:300])
+        v7 = r.json()
+        new_v = v7["version_no"]
+        c7 = {x["computed_id"]: x for x in v7["computed_columns"]}
+        check("被改列口径升到第2版", c7[diff_id]["def_no"] == 2, repr(c7[diff_id]))
+        check("直接依赖列自动升到第2版", c7[ratio_id]["def_no"] == 2, repr(c7[ratio_id]))
+        check("无关计算列沿用第1版", c7[const_id]["def_no"] == 1, repr(c7[const_id]))
+        check("下游公式仍是当时写法但绑定新上游",
+              c7[ratio_id]["formula"] == "气温_C / 温压差", c7[ratio_id]["formula"])
+
+        d = c.get("/api/observations", params={"station": "S01",
+                                               "hour_from": "2026-11-18T00:00",
+                                               "hour_to": "2026-11-18T00:00"}).json()
+        row = d["rows"][0]
+        check("新口径结果为 气压-温度=1008",
+              row["computed"][diff_id]["value"] == 1013 - 5,
+              repr(row["computed"][diff_id]["value"]))
+        check("自动升版列使用新上游(5/1008)",
+              row["computed"][ratio_id]["value"] == 5 / 1008,
+              repr(row["computed"][ratio_id]["value"]))
+        check("每行给出依赖口径与来源批次",
+              row["computed"][ratio_id]["def_version_no"] == new_v and
+              row["batch_version_no"] == 1 and
+              set(row["computed"][ratio_id]["source_columns"]) == {temp_id, pres_id},
+              json.dumps(row["computed"][ratio_id], ensure_ascii=False)[:400])
+
+        print("== 13. 旧口径整链复算 ==")
+        d = c.get("/api/observations", params={"station": "S01",
+                                               "hour_from": "2026-11-18T00:00",
+                                               "hour_to": "2026-11-18T00:00",
+                                               "def_version_no": def_v}).json()
+        row = d["rows"][0]
+        check("复算旧口径版本", d["def_version"]["version_no"] == def_v)
+        check("旧口径上游=温度-气压=-1008",
+              row["computed"][diff_id]["value"] == 5 - 1013,
+              repr(row["computed"][diff_id]["value"]))
+        check("旧口径下游沿旧依赖链=5/(-1008)",
+              row["computed"][ratio_id]["value"] == 5 / (5 - 1013),
+              repr(row["computed"][ratio_id]["value"]))
+        check("旧口径链中每个定义版本号正确",
+              [x["def_version_no"] for x in row["computed"][ratio_id]["chain"]] ==
+              [def_v, def_v],
+              json.dumps(row["computed"][ratio_id]["chain"], ensure_ascii=False)[:300])
+
+        print("== 14. 缺值 / 除零要说明原因 ==")
+        # 新批次缺 湿度、气压为 0，用于除零与缺值
+        csv_e = ("station_code,UTC小时,气温_C,气压,湿度\n"
+                 "S03,2026-11-18T05:00,,\n"
+                 "S03,2026-11-18T06:00,9,0,50\n")
+        r = up(c, "e.csv", csv_e)
+        check("含空值批次上传成功", r.status_code == 201, r.text[:300])
+        d = c.get("/api/observations", params={"station": "S03"}).json()
+        byh = {x["hour_utc"]: x for x in d["rows"]}
+        miss = byh["2026-11-18T05:00"]["computed"][diff_id]
+        check("缺值原因可读", miss["value"] is None and "缺值" in (miss["reason"] or ""),
+              json.dumps(miss, ensure_ascii=False)[:300])
+        # 直接做一个除以气压的计算列，验证除零说明
+        r = c.post("/api/versions", json={"note": "除零示例", "columns": [
+            {"source": "station", "name": "station_code"},
+            {"source": "hour_utc", "name": "UTC小时"},
+            {"source": temp_id, "name": "气温_C"},
+            {"source": pres_id, "name": "气压"},
+            {"source": hum_id, "name": "湿度"},
+        ], "computed_columns": [
+            {"name": "温度除气压", "op": "/",
+             "left": {"kind": "column", "ref": temp_id},
+             "right": {"kind": "column", "ref": pres_id}},
+        ]})
+        check("发布除零示例成功", r.status_code == 201, r.text[:300])
+        div = {x["name"]: x for x in r.json()["computed_columns"]}
+        div_id = div["温度除气压"]["computed_id"]
+        d = c.get("/api/observations", params={"station": "S03",
+                                               "hour_from": "2026-11-18T06:00",
+                                               "hour_to": "2026-11-18T06:00"}).json()
+        cell = d["rows"][0]["computed"][div_id]
+        check("除零原因可读", cell["value"] is None and "除零" in (cell["reason"] or ""),
+              json.dumps(cell, ensure_ascii=False)[:300])
+
+        print("== 15. 拒绝无效引用与成环，且不产生新版本 ==")
+        before = c.get("/api/versions/current").json()["version_no"]
+        base_cols = [
+            {"source": "station", "name": "station_code"},
+            {"source": "hour_utc", "name": "UTC小时"},
+            {"source": temp_id, "name": "气温_C"},
+            {"source": pres_id, "name": "气压"},
+            {"source": hum_id, "name": "湿度"},
+        ]
+        r = c.post("/api/versions", json={"note": "坏引用", "columns": base_cols,
+                                          "computed_columns": [
+            {"name": "坏", "op": "+",
+             "left": {"kind": "column", "ref": "c999"},
+             "right": {"kind": "const", "value": 1}}]})
+        check("拒绝引用不存在的原始列", r.status_code == 400 and "c999" in r.text, r.text[:300])
+
+        r = c.post("/api/versions", json={"note": "坏计算列引用", "columns": base_cols,
+                                          "computed_columns": [
+            {"name": "坏2", "op": "+",
+             "left": {"kind": "computed", "ref": "d999"},
+             "right": {"kind": "const", "value": 1}}]})
+        check("拒绝引用不存在的计算列", r.status_code == 400 and "d999" in r.text, r.text[:300])
+
+        r = c.post("/api/versions", json={"note": "成环", "columns": base_cols,
+                                          "computed_columns": [
+            {"column_id": diff_id, "op": "+",
+             "left": {"kind": "computed", "ref": ratio_id},
+             "right": {"kind": "const", "value": 1}}]})
+        check("拒绝成环", r.status_code == 400 and "成环" in r.text, r.text[:300])
+
+        r = c.post("/api/versions", json={"note": "同批自环", "columns": base_cols,
+                                          "computed_columns": [
+            {"name": "自环", "key": "self", "op": "+",
+             "left": {"kind": "computed", "ref": "self"},
+             "right": {"kind": "const", "value": 1}}]})
+        check("拒绝同批自环", r.status_code == 400 and "成环" in r.text, r.text[:300])
+
+        r = c.post("/api/versions", json={"note": "站号参与运算", "columns": base_cols,
+                                          "computed_columns": [
+            {"name": "站号运算", "op": "+",
+             "left": {"kind": "column", "ref": "station"},
+             "right": {"kind": "const", "value": 1}}]})
+        check("拒绝站号/小时列参与运算",
+              r.status_code == 400 and "站号" in r.text, r.text[:300])
+
+        r = c.post("/api/versions", json={"note": "改计算列名", "columns": base_cols,
+                                          "computed_columns": [
+            {"column_id": const_id, "name": "换个名字", "op": "+",
+             "left": {"kind": "const", "value": 1},
+             "right": {"kind": "const", "value": 2}}]})
+        check("拒绝变更计算列名称", r.status_code == 400 and "名称不可变更" in r.text, r.text[:300])
+
+        check("拒绝后现役版本不变", c.get("/api/versions/current").json()["version_no"] == before)
+        check("拒绝后供数不受影响",
+              c.get("/api/observations", params={"station": "S03"}).json()["row_count"] == 2)
+
+        print("== 16. 计算列查询选择 ==")
+        d = c.get("/api/observations", params={"computed_ids": const_id}).json()
+        check("只选中的计算列被返回",
+              all(set(x["computed"]) == {const_id} for x in d["rows"]), d["rows"][0]["computed"].keys())
+        r = c.get("/api/observations", params={"computed_ids": "d999"})
+        check("选不存在的计算列返回400", r.status_code == 400, r.text[:200])
+
     print()
     print(f"通过 {len(PASS)} 项，失败 {len(FAIL)} 项")
     if FAIL:

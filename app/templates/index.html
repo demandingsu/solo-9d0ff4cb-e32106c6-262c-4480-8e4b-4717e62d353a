@@ -32,12 +32,14 @@ code { background:var(--bg); padding:1px 5px; border-radius:4px; }
 details { margin:2px 0 10px; }
 summary { cursor:pointer; }
 .nullcell { color:#9a6700; font-size:12px; }
+th.calc, td.calc { background:#f0f7ff; }
+.badcell { color:var(--bad); font-size:12px; }
 </style>
 </head>
 <body>
 <header>
   <h1>环境监测小时观测数据平台</h1>
-  <p>结构版本化：改名 / 新增可空列 / 整数扩小数 可追溯；旧批次保留原值与原结构；删除列、合并列、缩型一律拒绝；失败操作不影响供数。</p>
+  <p>结构版本化：改名 / 新增可空列 / 整数扩小数 可追溯；旧批次保留原值与原结构；删除列、合并列、缩型一律拒绝；失败操作不影响供数。计算列按稳定列标识取数、口径可版本化，旧口径可整链复算。</p>
 </header>
 <main>
 
@@ -51,8 +53,18 @@ summary { cursor:pointer; }
   <div id="publish-box"></div>
 </section>
 
+<section id="sec-computed">
+  <h2>③ 计算列与口径</h2>
+  <p class="muted">每列只做一次加、减、乘或除；左右操作数可为常量、原始列（按稳定标识取数，
+    原始列改名 / 扩型后公式不变）或计算列。发布新口径时，直接或间接引用它的计算列会自动升版，
+    无关计算列沿用原口径。引用无效或成环会整批拒绝。</p>
+  <div id="computed-publish"></div>
+  <div class="msg" id="computed-msg"></div>
+  <div id="computed-list"></div>
+</section>
+
 <section id="sec-upload">
-  <h2>③ 上传观测 CSV</h2>
+  <h2>④ 上传观测 CSV</h2>
   <p class="muted" id="csv-hint"></p>
   <div class="row">
     <input type="file" id="csv-file" accept=".csv,text/csv">
@@ -62,31 +74,36 @@ summary { cursor:pointer; }
 </section>
 
 <section id="sec-query">
-  <h2>④ 查询观测</h2>
+  <h2>⑤ 查询观测与计算结果</h2>
   <div class="row">
     <label>站号 <input id="q-station" placeholder="如 S01（可空）"></label>
     <label>起始 <input id="q-from" placeholder="2026-11-18T00:00"></label>
     <label>截止 <input id="q-to" placeholder="2026-11-18T23:00"></label>
-    <label>视角 <select id="q-version"></select></label>
+    <label>批次视角 <select id="q-version"></select></label>
+    <label>计算口径 <select id="q-def-version"></select></label>
     <button onclick="doQuery()">查询</button>
   </div>
+  <div class="row" id="q-computed-wrap">
+    <span class="muted">计算列：</span><span id="q-computed"></span>
+  </div>
+  <div class="muted" id="q-def-hint"></div>
   <div id="query-result"></div>
 </section>
 
 <section id="sec-versions">
-  <h2>⑤ 版本历史</h2>
+  <h2>⑥ 版本历史</h2>
   <div id="versions-box"></div>
 </section>
 
 <section id="sec-batches">
-  <h2>⑥ 批次列表</h2>
+  <h2>⑦ 批次列表</h2>
   <div id="batches-box"></div>
 </section>
 
 </main>
 <script>
 const $ = id => document.getElementById(id);
-const state = { current: null, versions: [], batches: [] };
+const state = { current: null, versions: [], batches: [], computed: [] };
 const TYPE_LABEL = { station:'站号(系统)', hour:'UTC小时(系统)', integer:'整数', float:'小数', text:'文本' };
 
 async function api(path, opts){
@@ -99,6 +116,7 @@ async function api(path, opts){
   return body;
 }
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmt = v => (v === null || v === undefined) ? '<span class="nullcell">（空）</span>' : esc(v);
 function showErr(el, e){
   el.innerHTML = '<div class="err">✗ ' + esc(e.message) + '</div>' +
     ((e.errors && e.errors.length) ? '<ul class="err-list">' + e.errors.map(x => '<li>' + esc(x) + '</li>').join('') + '</ul>' : '');
@@ -108,7 +126,9 @@ async function refresh(){
   try { state.current = await api('/api/versions/current'); } catch(e) { state.current = null; }
   state.versions = (await api('/api/versions')).versions;
   state.batches = (await api('/api/batches')).batches;
-  renderCurrent(); renderPublish(); renderVersions(); renderBatches(); renderLensOptions();
+  state.computed = (await api('/api/computed-columns')).computed_columns;
+  renderCurrent(); renderPublish(); renderComputed(); renderVersions(); renderBatches();
+  renderLensOptions(); renderComputedPicker();
 }
 
 function colTable(cols){
@@ -126,12 +146,15 @@ function renderCurrent(){
     return;
   }
   const v = state.current;
+  const cp = v.computed_columns || [];
   box.innerHTML = '<p>现役版本 <b>v' + v.version_no + '</b><span class="badge">active</span> ' +
-    '<span class="muted">' + esc(v.created_at) + (v.note ? ' · ' + esc(v.note) : '') + '</span></p>' + colTable(v.columns);
-  $('csv-hint').textContent = 'CSV 表头须与现役结构一致（顺序不限）：' + v.columns.map(c => c.name).join(', ');
+    '<span class="muted">' + esc(v.created_at) + (v.note ? ' · ' + esc(v.note) : '') + '</span></p>' + colTable(v.columns) +
+    (cp.length ? '<p class="muted">本版计算列口径：' + cp.map(c =>
+      esc(c.name) + ' <code>' + esc(c.formula) + '</code>（口径 ' + esc(c.computed_id) + '/第' + c.def_no + '版）').join('；') + '</p>' : '');
+  $('csv-hint').textContent = 'CSV 表头须与现役结构一致（顺序不限，计算列不入 CSV）：' + v.columns.map(c => c.name).join(', ');
 }
 
-/* ---------- 发布 ---------- */
+/* ---------- 发布原始列 ---------- */
 
 function renderPublish(){
   const box = $('publish-box');
@@ -225,6 +248,158 @@ async function publishEvolution(){
   }catch(e){ showErr(msg, e); }
 }
 
+/* ---------- 计算列发布 ---------- */
+
+function operandOptions(selected){
+  selected = selected || '';
+  const v = state.current;
+  const raw = v ? v.columns.filter(c => c.type !== 'station' && c.type !== 'hour' && c.type !== 'text') : [];
+  const opt = (val, label) => '<option value="' + esc(val) + '"' + (val === selected ? ' selected' : '') + '>' + esc(label) + '</option>';
+  let h = '<optgroup label="原始列">' + raw.map(c =>
+    opt('column:' + c.column_id, c.name + '（' + c.column_id + '）')).join('') + '</optgroup>';
+  const comp = state.computed.filter(c => c.current_def);
+  if(comp.length){
+    h += '<optgroup label="计算列（现役口径）">' + comp.map(c =>
+      opt('computed:' + c.computed_id, c.name + '（' + c.computed_id + '）')).join('') + '</optgroup>';
+  }
+  return h;
+}
+
+function addComputedRow(){
+  const tr = document.createElement('tr');
+  tr.setAttribute('data-cnew', '1');
+  tr.innerHTML = '<td><input data-name placeholder="计算列名，如 温压比"></td>' +
+    '<td><select data-left><option value="const">常量</option>' + operandOptions() + '</select></td>' +
+    '<td class="muted">—</td>' +
+    '<td><input data-leftval type="number" step="any" value="1"></td>' +
+    '<td><select data-op><option>+</option><option>-</option><option>*</option><option>/</option></select></td>' +
+    '<td><select data-right><option value="const">常量</option>' + operandOptions() + '</select></td>' +
+    '<td><input data-rightval type="number" step="any" value="0"></td>' +
+    '<td><button class="ghost" onclick="this.closest(\'tr\').remove()">移除</button></td>';
+  $('c-table').appendChild(tr);
+  bindOperandRow(tr);
+}
+
+function newComputedRow(){
+  return '<tr data-cnew="1"><td><input data-name placeholder="计算列名"></td>' +
+    '<td><select data-left><option value="const">常量</option>' + operandOptions() + '</select></td>' +
+    '<td class="muted">—</td><td><input data-leftval type="number" step="any" value="1"></td>' +
+    '<td><select data-op><option>+</option><option>-</option><option>*</option><option>/</option></select></td>' +
+    '<td><select data-right><option value="const">常量</option>' + operandOptions() + '</select></td>' +
+    '<td><input data-rightval type="number" step="any" value="0"></td>' +
+    '<td><button class="ghost" onclick="this.closest(\'tr\').remove()">移除</button></td></tr>';
+}
+
+function bindOperandRow(tr){
+  [['data-left','data-leftval'],['data-right','data-rightval']].forEach(([s,v]) => {
+    const sel = tr.querySelector('[' + s + ']');
+    const val = tr.querySelector('[' + v + ']');
+    const sync = () => {
+      const isConst = sel.value === 'const';
+      val.style.display = isConst ? '' : 'none';
+    };
+    if(sel && val){ sel.addEventListener('change', sync); sync(); }
+  });
+}
+
+function renderComputed(){
+  const box = $('computed-publish');
+  if(!state.current){
+    box.innerHTML = '<p class="muted">先发布初版结构，再定义计算列。</p>';
+    $('computed-list').innerHTML = '';
+    return;
+  }
+  const v = state.current;
+  const rows = (v.computed_columns || []).map(c => {
+    const lref = c.left.kind === 'const' ? 'const' : c.left.kind + ':' + c.left.ref;
+    const rref = c.right.kind === 'const' ? 'const' : c.right.kind + ':' + c.right.ref;
+    return '<tr data-cid="' + esc(c.computed_id) + '">' +
+      '<td><code>' + esc(c.computed_id) + '</code><br><span class="muted">现口径第' + c.def_no + '版</span></td>' +
+      '<td>' + esc(c.name) + '</td>' +
+      '<td><select data-left><option value="const"' + (c.left.kind === 'const' ? ' selected' : '') + '>常量</option>' +
+        operandOptions(lref) + '</select></td>' +
+      '<td>' + (c.left.kind === 'const' ? '<input data-leftval type="number" step="any" value="' + esc(c.left.value) + '">' : '<span class="muted">—</span>') + '</td>' +
+      '<td><select data-op>' + ['+','-','*','/'].map(o => '<option' + (o === c.op ? ' selected' : '') + '>' + o + '</option>').join('') + '</select></td>' +
+      '<td><select data-right><option value="const"' + (c.right.kind === 'const' ? ' selected' : '') + '>常量</option>' +
+        operandOptions(rref) + '</select></td>' +
+      '<td>' + (c.right.kind === 'const' ? '<input data-rightval type="number" step="any" value="' + esc(c.right.value) + '">' : '<span class="muted">—</span>') + '</td>' +
+      '<td><span class="muted">不改口径则不要勾选</span><br><label class="muted"><input type="checkbox" data-bump> 发布新口径</label></td>' +
+      '</tr>';
+  }).join('');
+
+  box.innerHTML =
+    '<p class="muted">现役 v' + v.version_no + ' 的计算列。勾选「发布新口径」并调整公式即为其升版；' +
+    '直接或间接引用它的计算列会自动升版，无关列沿用原口径。</p>' +
+    '<table id="c-table"><tr><th>标识</th><th>名称</th><th>左操作数</th><th>左常量</th><th>运算</th>' +
+    '<th>右操作数</th><th>右常量</th><th>操作</th></tr>' + rows + '</table>' +
+    '<div class="row"><button class="ghost" onclick="addComputedRow()">+ 新增计算列</button>' +
+    '<label>备注 <input id="c-note" placeholder="可选"></label>' +
+    '<button onclick="publishComputed()">发布计算列口径（同时生成新版本 v' + (v.version_no + 1) + '）</button></div>';
+
+  document.querySelectorAll('#c-table tr[data-cid]').forEach(bindOperandRow);
+  document.querySelectorAll('#c-table tr[data-cnew]').forEach(bindOperandRow);
+
+  let h = '';
+  state.computed.forEach(c => {
+    h += '<p><b>' + esc(c.name) + '</b> <code>' + esc(c.computed_id) + '</code> ' +
+      '<span class="muted">现口径：' + esc(c.formula) + '</span></p>' +
+      '<details><summary class="muted">口径历史（' + c.definitions.length + ' 版）</summary><ul class="muted">' +
+      c.definitions.map(d => '<li>第' + d.def_no + '版（随 v' + d.created_version_no + ' 发布）：<code>' +
+        esc(d.formula) + '</code></li>').join('') + '</ul></details>';
+  });
+  $('computed-list').innerHTML = h || '<p class="muted">暂无计算列。</p>';
+}
+
+function operandFrom(kindSel, valInput){
+  const v = kindSel.value;
+  if(v === 'const') return { kind:'const', value:Number(valInput.value) };
+  const [kind, ref] = v.split(':');
+  return { kind, ref };
+}
+
+async function publishComputed(){
+  const msg = $('computed-msg'); msg.innerHTML = '';
+  if(!state.current){ showErr(msg, { message:'请先发布初版结构' }); return; }
+  const specs = [];
+  let bad = false;
+  document.querySelectorAll('#c-table tr[data-cid]').forEach(tr => {
+    const bump = tr.querySelector('[data-bump]');
+    if(!bump || !bump.checked) return;
+    const cid = tr.getAttribute('data-cid');
+    const leftSel = tr.querySelector('[data-left]');
+    const rightSel = tr.querySelector('[data-right]');
+    specs.push({
+      column_id: cid,
+      op: tr.querySelector('[data-op]').value,
+      left: operandFrom(leftSel, tr.querySelector('[data-leftval]')),
+      right: operandFrom(rightSel, tr.querySelector('[data-rightval]')),
+    });
+  });
+  document.querySelectorAll('#c-table tr[data-cnew]').forEach(tr => {
+    const name = tr.querySelector('[data-name]').value.trim();
+    if(!name){ bad = true; return; }
+    specs.push({
+      name,
+      op: tr.querySelector('[data-op]').value,
+      left: operandFrom(tr.querySelector('[data-left]'), tr.querySelector('[data-leftval]')),
+      right: operandFrom(tr.querySelector('[data-right]'), tr.querySelector('[data-rightval]')),
+    });
+  });
+  if(bad){ showErr(msg, { message:'新增计算列必须填写名称' }); return; }
+  if(!specs.length){ showErr(msg, { message:'没有要发布的内容：请勾选升版口径或新增计算列' }); return; }
+
+  // 沿用原始列映射（保持不变），计算列不带 columns 以外的改动
+  const cols = state.current.columns.map(c => ({ source: c.column_id, name: c.name, type: c.type }));
+  try{
+    const r = await api('/api/versions', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ note: ($('c-note') && $('c-note').value.trim()) || '计算列口径变更',
+        columns: cols, computed_columns: specs }) });
+    await refresh();
+    const bumped = (r.computed_columns || []).map(c => c.name + '（第' + c.def_no + '版）').join('、');
+    $('computed-msg').innerHTML = '<div class="ok">✓ 已发布 v' + r.version_no + '，当前计算列口径：' + esc(bumped) + '</div>';
+  }catch(e){ showErr(msg, e); }
+}
+
 /* ---------- 上传 ---------- */
 
 async function uploadCsv(){
@@ -250,6 +425,40 @@ function renderLensOptions(){
   });
   sel.innerHTML = opts;
   if([...sel.options].some(o => o.value === cur)) sel.value = cur;
+  sel.onchange = () => doQuery();
+
+  const dsel = $('q-def-version');
+  const dcur = dsel.value;
+  let dopts = '<option value="">跟随批次视角（现役时用现役口径）</option>';
+  state.versions.forEach(v => {
+    const n = (v.computed_columns || []).length;
+    dopts += '<option value="' + v.version_no + '">口径 v' + v.version_no + '（' + n + ' 个计算列 · ' +
+      (v.status === 'active' ? '现役' : '历史') + '）</option>';
+  });
+  dsel.innerHTML = dopts;
+  if([...dsel.options].some(o => o.value === dcur)) dsel.value = dcur;
+  dsel.onchange = () => { renderComputedPicker(); doQuery(); };
+}
+
+function renderComputedPicker(){
+  // 选择器要跟随“计算口径”版本：历史口径里的计算列集合可能不同
+  const defNo = $('q-def-version').value;
+  const ver = defNo
+    ? state.versions.find(v => String(v.version_no) === defNo)
+    : state.current;
+  const cols = (ver && ver.computed_columns) || [];
+  const box = $('q-computed');
+  if(!cols.length){
+    box.innerHTML = '<span class="muted">（该口径暂无计算列）</span>';
+    return;
+  }
+  // 已存在的勾选状态优先；首次渲染（无任何输入框）默认全选
+  const existing = [...box.querySelectorAll('input')];
+  const prev = new Set(existing.filter(x => x.checked).map(x => x.value));
+  box.innerHTML = cols.map(c =>
+    '<label style="margin-right:12px"><input type="checkbox" value="' + esc(c.computed_id) + '"' +
+    (existing.length === 0 || prev.has(c.computed_id) ? ' checked' : '') + '> ' + esc(c.name) + '</label>').join('');
+  box.querySelectorAll('input').forEach(x => x.addEventListener('change', () => doQuery()));
 }
 
 async function doQuery(){
@@ -259,19 +468,41 @@ async function doQuery(){
   if($('q-from').value.trim()) p.set('hour_from', $('q-from').value.trim());
   if($('q-to').value.trim()) p.set('hour_to', $('q-to').value.trim());
   if($('q-version').value) p.set('version_no', $('q-version').value);
+  if($('q-def-version').value) p.set('def_version_no', $('q-def-version').value);
+  const picked = [...document.querySelectorAll('#q-computed input:checked')].map(x => x.value);
+  if(picked.length) p.set('computed_ids', picked.join(','));
   try{
     const d = await api('/api/observations?' + p.toString());
     const cols = d.version.columns;
-    let h = '<p class="muted">视角：v' + d.version.version_no + '（' + (d.version.status === 'active' ? '现役' : '历史') +
-      '）· 共 ' + d.row_count + ' 行' + (d.truncated ? '（已达上限，结果截断）' : '') + '</p>';
+    const comp = d.computed_columns || [];
+    let h = '<p class="muted">批次视角：v' + d.version.version_no + '（' + (d.version.status === 'active' ? '现役' : '历史') +
+      '）· 计算口径：v' + d.def_version.version_no + ' · 共 ' + d.row_count + ' 行' +
+      (d.truncated ? '（已达上限，结果截断）' : '') + '</p>';
+    if(comp.length){
+      h += '<p class="muted">计算列：' + comp.map(c => esc(c.name) + ' <code>' + esc(c.formula) +
+        '</code>（第' + c.def_no + '版，随 v' + c.def_version_no + '）').join('；') + '</p>';
+    }
     if(!d.rows.length){ box.innerHTML = h + '<p class="muted">无匹配数据。</p>'; return; }
     h += '<table><tr><th>批次</th><th>批次版本</th>' +
-      cols.map(c => '<th>' + esc(c.name) + '<br><span class="muted">' + TYPE_LABEL[c.type] + '</span></th>').join('') + '</tr>';
+      cols.map(c => '<th>' + esc(c.name) + '<br><span class="muted">' + TYPE_LABEL[c.type] + '</span></th>').join('') +
+      comp.map(c => '<th class="calc">' + esc(c.name) + '<br><span class="muted">计算 · ' + esc(c.computed_id) + '</span></th>').join('') +
+      '</tr>';
     d.rows.forEach(r => {
-      h += '<tr><td>#' + r.batch_id + '</td><td>v' + r.batch_version_no + '</td>' +
-        cols.map(c => {
-          const val = r.values[c.name];
-          return '<td>' + (val === null || val === undefined ? '<span class="nullcell">（空）</span>' : esc(val)) + '</td>';
+      h += '<tr><td>#' + r.batch_id + '<br><span class="muted">' + esc(r.batch_filename) + '</span></td>' +
+        '<td>v' + r.batch_version_no + '</td>' +
+        cols.map(c => '<td>' + fmt(r.values[c.name]) + '</td>').join('') +
+        comp.map(c => {
+          const x = r.computed[c.computed_id];
+          if(!x) return '<td class="muted">—</td>';
+          if(x.value === null || x.value === undefined){
+            return '<td class="badcell">—<br><span class="err">' + esc(x.reason || '缺值') + '</span></td>';
+          }
+          return '<td class="calc"><b>' + esc(x.value) + '</b><details><summary class="muted">依赖</summary>' +
+            '<div class="muted">口径：第' + x.def_no + '版（随 v' + x.def_version_no + '）<br>' +
+            '来源原始列：' + (x.source_columns.map(s => esc(s)).join('、') || '无') + '<br>依赖链：' +
+            x.chain.map(s => esc(s.name) + '=' + (s.value === null ? '（空：' + esc(s.reason || '') + '）' : esc(s.value)) +
+              '（第' + s.def_no + '版/v' + s.def_version_no + '）').join(' → ') +
+            '</div></details></td>';
         }).join('') + '</tr>';
     });
     box.innerHTML = h + '</table>';
@@ -285,16 +516,29 @@ function renderVersions(){
   if(!state.versions.length){ box.innerHTML = '<p class="muted">暂无版本。</p>'; return; }
   let h = '';
   [...state.versions].reverse().forEach(v => {
+    const cp = v.computed_columns || [];
     h += '<p><b>v' + v.version_no + '</b>' +
       (v.status === 'active' ? '<span class="badge">active</span>' : '<span class="badge old">已替换</span>') +
       ' <span class="muted">' + esc(v.created_at) + (v.note ? ' · ' + esc(v.note) : '') + '</span> ' +
-      '<button class="ghost" onclick="lensTo(' + v.version_no + ')">以此视角查询</button></p>' +
-      '<details><summary class="muted">列结构（' + v.columns.length + ' 列）</summary>' + colTable(v.columns) + '</details>';
+      '<button class="ghost" onclick="lensTo(' + v.version_no + ')">以此视角查询</button> ' +
+      '<button class="ghost" onclick="defTo(' + v.version_no + ')">以此口径复算</button></p>' +
+      '<details><summary class="muted">列结构（' + v.columns.length + ' 列）</summary>' + colTable(v.columns) + '</details>' +
+      (cp.length ? '<details><summary class="muted">计算列口径（' + cp.length + ' 个）</summary><ul class="muted">' +
+        cp.map(c => '<li>' + esc(c.name) + ' <code>' + esc(c.computed_id) + '</code>：<code>' + esc(c.formula) +
+          '</code>（口径第' + c.def_no + '版，随 v' + c.created_version_no + '）</li>').join('') + '</ul></details>' : '');
   });
   box.innerHTML = h;
 }
 function lensTo(v){
   $('q-version').value = String(v);
+  $('q-def-version').value = '';
+  renderComputedPicker();
+  document.getElementById('sec-query').scrollIntoView({behavior:'smooth'});
+  doQuery();
+}
+function defTo(v){
+  $('q-def-version').value = String(v);
+  renderComputedPicker();
   document.getElementById('sec-query').scrollIntoView({behavior:'smooth'});
   doQuery();
 }

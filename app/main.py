@@ -50,7 +50,7 @@ def api_current_version():
         v = core.get_active_version(conn)
         if v is None:
             raise core.NotFoundError("尚未发布任何结构版本")
-        return core.version_with_columns(conn, v)
+        return core.version_bundle(conn, v)
 
 
 @app.get("/api/versions/{version_no}")
@@ -59,7 +59,13 @@ def api_get_version(version_no: int):
         v = core.get_version(conn, version_no)
         if v is None:
             raise core.NotFoundError(f"版本 v{version_no} 不存在")
-        return core.version_with_columns(conn, v)
+        return core.version_bundle(conn, v)
+
+
+@app.get("/api/computed-columns")
+def api_computed_columns():
+    with session() as conn:
+        return {"computed_columns": core.list_computed_columns(conn)}
 
 
 @app.post("/api/versions", status_code=201)
@@ -93,6 +99,8 @@ def api_observations(
     hour_from: str | None = None,
     hour_to: str | None = None,
     version_no: int | None = None,
+    computed_ids: str | None = None,
+    def_version_no: int | None = None,
     limit: int = 1000,
 ):
     limit = max(1, min(limit, 10000))
@@ -101,8 +109,10 @@ def api_observations(
         ht = core.normalize_hour(hour_to) if hour_to else None
     except ValueError as e:
         raise core.DomainError(str(e))
+    sel = [x for x in (computed_ids or "").split(",") if x.strip()] or None
     with session() as conn:
         return core.query_observations(
             conn, station=station, hour_from=hf, hour_to=ht,
-            version_no=version_no, limit=limit,
+            version_no=version_no, computed_ids=sel,
+            def_version_no=def_version_no, limit=limit,
         )

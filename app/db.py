@@ -47,6 +47,39 @@ CREATE TABLE IF NOT EXISTS observations (
 );
 CREATE INDEX IF NOT EXISTS idx_obs_station_hour ON observations (station, hour_utc);
 CREATE INDEX IF NOT EXISTS idx_obs_batch ON observations (batch_id);
+
+-- 计算列：稳定标识 computed_id（d1 / d2 …），名称不可变；公式按标识引用原始列。
+CREATE TABLE IF NOT EXISTS computed_columns (
+    computed_id        TEXT PRIMARY KEY,
+    name               TEXT NOT NULL UNIQUE,
+    created_version_no INTEGER NOT NULL,
+    created_at         TEXT NOT NULL
+);
+-- 口径（定义）不可变；每次发布新定义追加一行，def_no 在同一计算列内递增。
+CREATE TABLE IF NOT EXISTS computed_definitions (
+    def_id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    computed_id        TEXT NOT NULL REFERENCES computed_columns(computed_id),
+    def_no             INTEGER NOT NULL,
+    op                 TEXT NOT NULL CHECK (op IN ('+', '-', '*', '/')),
+    left_kind          TEXT NOT NULL CHECK (left_kind IN ('const', 'column', 'computed')),
+    left_ref           TEXT,
+    left_value_json    TEXT,
+    right_kind         TEXT NOT NULL CHECK (right_kind IN ('const', 'column', 'computed')),
+    right_ref          TEXT,
+    right_value_json   TEXT,
+    created_version_no INTEGER NOT NULL,
+    created_at         TEXT NOT NULL,
+    UNIQUE (computed_id, def_no)
+);
+-- 每个结构版本使用哪一版口径：旧口径复算时依赖链按这张快照解析。
+CREATE TABLE IF NOT EXISTS schema_version_computed (
+    version_id  INTEGER NOT NULL REFERENCES schema_versions(id) ON DELETE CASCADE,
+    computed_id TEXT NOT NULL REFERENCES computed_columns(computed_id),
+    def_id      INTEGER NOT NULL REFERENCES computed_definitions(def_id),
+    PRIMARY KEY (version_id, computed_id)
+);
+CREATE INDEX IF NOT EXISTS idx_svc_def ON schema_version_computed (def_id);
+CREATE INDEX IF NOT EXISTS idx_cdef_computed ON computed_definitions (computed_id, def_no);
 """
 
 
